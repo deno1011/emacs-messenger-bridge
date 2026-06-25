@@ -14,7 +14,14 @@
   "Run BODY with `messenger-bridge-directory' bound to a fresh temp dir."
   (declare (indent 0))
   `(let ((messenger-bridge-directory (make-temp-file "mbridge" t "/"))
-         (messenger-on-message-functions nil))
+         (messenger-on-message-functions nil)
+         ;; default guardrails off for the plain send tests
+         (messenger-send-block-unknown nil)
+         (messenger-send-min-interval 0)
+         (messenger-send-max-per-hour 0)
+         (messenger-send-allowlist nil)
+         (messenger-send--history nil)
+         (messenger-bridge--seen-jids (make-hash-table :test 'equal)))
      (unwind-protect
          (progn (messenger-bridge--ensure-dirs) ,@body)
        (delete-directory messenger-bridge-directory t))))
@@ -72,6 +79,36 @@
       (should-not (equal a b))
       (should (= 2 (length (directory-files (messenger-bridge--subdir "outbox")
                                             nil "\\.json\\'")))))))
+
+(ert-deftest messenger-bridge-test-guardrail-blocks-unknown ()
+  "With the guardrail on, sending to an unapproved/unseen JID is refused."
+  (messenger-bridge-tests--with-temp-bridge
+    (let ((messenger-send-block-unknown t))
+      (should-error (messenger-send "stranger@x" "hi") :type 'user-error)
+      ;; allowlisting approves it
+      (let ((messenger-send-allowlist '("stranger@x")))
+        (should (messenger-send "stranger@x" "hi")))
+      ;; a JID that messaged us (seen) is allowed without allowlisting
+      (puthash "friend@x" t messenger-bridge--seen-jids)
+      (should (messenger-send "friend@x" "reply")))))
+
+(ert-deftest messenger-bridge-test-rate-limit ()
+  "The min-interval rate limit refuses a too-fast second send."
+  (messenger-bridge-tests--with-temp-bridge
+    (let ((messenger-send-block-unknown nil)
+          (messenger-send-min-interval 60))
+      (should (messenger-send "me" "1"))
+      (should-error (messenger-send "me" "2") :type 'user-error))))
+
+(ert-deftest messenger-bridge-test-process-records-seen ()
+  "Processing an inbound message records its chat JID as seen."
+  (messenger-bridge-tests--with-temp-bridge
+    (let ((file (messenger-bridge--write-json "inbox"
+                  (list :id "s1" :channel "whatsapp" :chat "x@lid"
+                        :text "hi" :timestamp "2026-06-25T00:00:00Z"
+                        :meta (make-hash-table :test 'equal)))))
+      (messenger-bridge--process-file file)
+      (should (gethash "x@lid" messenger-bridge--seen-jids)))))
 
 (provide 'messenger-bridge-tests)
 ;;; messenger-bridge-tests.el ends here

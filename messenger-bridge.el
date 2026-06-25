@@ -3,7 +3,7 @@
 ;; Copyright (c) 2026 Denis Butic
 
 ;; Author: Denis Butic <d.e.n.o@gmx.net>
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, tools
 ;; Homepage: https://github.com/deno1011/emacs-messenger-bridge
@@ -58,6 +58,36 @@ Holds the inbox/, outbox/, sent/ and processed/ subdirectories."
 (defcustom messenger-default-channel "mock"
   "Channel name stamped on outbound messages when none is given."
   :type 'string)
+
+;;;; Outbound guardrails
+
+(defcustom messenger-send-allowlist nil
+  "JIDs `messenger-send' may INITIATE to without restriction.
+Recipients who have messaged you (seen this session) are always allowed —
+replying is consent-based.  Only initiating to a new, unseen JID is gated.
+Approve one with `messenger-allow-recipient'."
+  :type '(repeat string))
+
+(defcustom messenger-send-block-unknown t
+  "When non-nil, refuse `messenger-send' to a JID that is neither in
+`messenger-send-allowlist' nor seen (has messaged you).  This guardrail stops
+an agent from messaging arbitrary contacts.  Set nil to allow any recipient —
+NOT recommended, it raises WhatsApp ban risk."
+  :type 'boolean)
+
+(defcustom messenger-send-min-interval 2
+  "Minimum seconds between outbound sends (rate limit); 0 disables."
+  :type 'number)
+
+(defcustom messenger-send-max-per-hour 30
+  "Maximum outbound sends per rolling hour; 0 disables."
+  :type 'integer)
+
+(defvar messenger-bridge--seen-jids (make-hash-table :test 'equal)
+  "JIDs we received messages from this session (auto-allowed for replies).")
+
+(defvar messenger-send--history nil
+  "Float-time stamps of recent sends (newest first), for rate limiting.")
 
 (defvar messenger-on-message-functions nil
   "Abnormal hook run once per inbound message.
@@ -124,12 +154,43 @@ watcher never observes a partial file."
 
 ;;;; Outbound
 
+(defun messenger-send--recipient-allowed-p (chat)
+  "Non-nil if CHAT is an approved outbound recipient.
+Approved = guardrail off, allowlisted, or seen (they messaged you)."
+  (or (not messenger-send-block-unknown)
+      (member chat messenger-send-allowlist)
+      (gethash chat messenger-bridge--seen-jids)))
+
+(defun messenger-send--rate-check ()
+  "Signal a `user-error' if the outbound rate limits are exceeded."
+  (let ((now (float-time)))
+    (setq messenger-send--history
+          (seq-filter (lambda (ts) (< (- now ts) 3600)) messenger-send--history))
+    (when (and (> messenger-send-min-interval 0)
+               messenger-send--history
+               (< (- now (car messenger-send--history))
+                  messenger-send-min-interval))
+      (user-error "messenger: rate limit — wait ~%ss between sends"
+                  messenger-send-min-interval))
+    (when (and (> messenger-send-max-per-hour 0)
+               (>= (length messenger-send--history) messenger-send-max-per-hour))
+      (user-error "messenger: hourly send cap (%d) reached"
+                  messenger-send-max-per-hour))))
+
 ;;;###autoload
 (defun messenger-send (chat text &optional channel meta)
   "Queue an outbound TEXT to CHAT on CHANNEL into the bridge outbox.
 CHANNEL defaults to `messenger-default-channel'.  META is an optional plist of
 channel-specific extras.  Return the message id.  An external adapter watching
-outbox/ delivers it."
+outbox/ delivers it.
+
+Guardrails (never prompt — safe to call from an agent): refuses when CHAT is
+not an approved recipient (see `messenger-send--recipient-allowed-p' /
+`messenger-allow-recipient') and enforces the rate limit."
+  (unless (messenger-send--recipient-allowed-p chat)
+    (user-error "messenger: %s not approved (they have not messaged you) — \
+approve with M-x messenger-allow-recipient" chat))
+  (messenger-send--rate-check)
   (messenger-bridge--ensure-dirs)
   (let* ((id (messenger-bridge--uuid))
          (plist (list :id id
@@ -139,6 +200,7 @@ outbox/ delivers it."
                       :timestamp (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t)
                       :meta (or meta (make-hash-table :test 'equal)))))
     (messenger-bridge--write-json "outbox" plist)
+    (push (float-time) messenger-send--history)
     id))
 
 ;;;; Inbound
@@ -149,6 +211,8 @@ Non-JSON or unparsable files are left in place untouched."
   (when (string-suffix-p ".json" file)
     (let ((msg (messenger-bridge--read-message file)))
       (when msg
+        (let ((from (plist-get msg :chat)))
+          (when from (puthash from t messenger-bridge--seen-jids)))
         (run-hook-with-args 'messenger-on-message-functions msg)
         (rename-file file
                      (expand-file-name (file-name-nondirectory file)
@@ -230,6 +294,70 @@ dies and catches any messages the watch missed, so delivery stays reliable."
                     (or (plist-get msg :text) "")))))
 
 (add-hook 'messenger-on-message-functions #'messenger-bridge-log-handler)
+
+;;;; Recipient approval + contacts (name resolution)
+
+;;;###autoload
+(defun messenger-allow-recipient (jid)
+  "Approve JID as an outbound recipient (add to `messenger-send-allowlist').
+This is the explicit consent step before the agent may INITIATE to someone who
+has not messaged you.  Mind the WhatsApp ban risk of messaging many contacts."
+  (interactive (list (read-string "Approve recipient JID: ")))
+  (add-to-list 'messenger-send-allowlist jid)
+  (message "messenger: %s approved for sending" jid))
+
+;;;###autoload
+(defun messenger-revoke-recipient (jid)
+  "Remove JID from `messenger-send-allowlist'."
+  (interactive (list (completing-read "Revoke JID: " messenger-send-allowlist)))
+  (setq messenger-send-allowlist (delete jid messenger-send-allowlist))
+  (message "messenger: %s revoked" jid))
+
+(defun messenger-contacts ()
+  "Return exported contacts as an alist (JID . plist) from contacts.json, or nil.
+The WhatsApp adapter writes contacts.json into `messenger-bridge-directory'."
+  (let ((f (expand-file-name "contacts.json" messenger-bridge-directory)))
+    (when (file-exists-p f)
+      (ignore-errors
+        (with-temp-buffer
+          (insert-file-contents f)
+          (json-parse-string (buffer-string)
+                             :object-type 'alist :null-object nil))))))
+
+(defun messenger-resolve-name (name)
+  "Return the JID of the contact matching NAME (case-insensitive substring).
+Signal an error if no match or if more than one contact matches."
+  (let* ((needle (downcase name))
+         (matches
+          (seq-filter
+           (lambda (c)
+             (let* ((v (cdr c))
+                    (n (alist-get 'name v))
+                    (notify (alist-get 'notify v)))
+               (or (and (stringp n) (string-search needle (downcase n)))
+                   (and (stringp notify) (string-search needle (downcase notify))))))
+           (messenger-contacts))))
+    (cond
+     ((null matches) (user-error "messenger: no contact matches %S" name))
+     ((cdr matches)
+      (user-error "messenger: %S is ambiguous (%d matches) — use the JID"
+                  name (length matches)))
+     (t (symbol-name (caar matches))))))
+
+;;;###autoload
+(defun messenger-send-to-name (name text &optional channel)
+  "Resolve NAME to a JID via contacts and send TEXT (interactive: confirms).
+Called interactively, asks for confirmation and approves the recipient first —
+the smooth path for you to message a friend.  Programmatic callers should use
+`messenger-send' with an already-approved JID."
+  (interactive
+   (let* ((name (read-string "Contact name: "))
+          (jid (messenger-resolve-name name)))
+     (unless (y-or-n-p (format "Send to %s (%s)? " name jid))
+       (user-error "Cancelled"))
+     (messenger-allow-recipient jid)
+     (list name (read-string (format "Message to %s: " name)) nil)))
+  (messenger-send (messenger-resolve-name name) text channel))
 
 (provide 'messenger-bridge)
 ;;; messenger-bridge.el ends here
