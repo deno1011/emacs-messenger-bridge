@@ -3,7 +3,7 @@
 ;; Copyright (c) 2026 Denis Butic
 
 ;; Author: Denis Butic <d.e.n.o@gmx.net>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, tools
 ;; Homepage: https://github.com/deno1011/emacs-messenger-bridge
@@ -65,8 +65,18 @@ Each function receives one argument: the message as a plist with keys
 :id :channel :chat :text :timestamp :meta.  This is the integration point a
 consumer (e.g. a chat agent) hooks into.")
 
+(defcustom messenger-bridge-poll-interval 3
+  "Seconds between inbox poll/self-heal ticks; 0 disables the poll.
+A poll fallback makes delivery robust even when the `file-notify' watch dies
+\(e.g. after heavy daemon activity): every tick processes any inbox backlog
+and re-arms the watch if it became invalid."
+  :type 'number)
+
 (defvar messenger-bridge--watch nil
   "The active `file-notify' watch descriptor for inbox/, or nil.")
+
+(defvar messenger-bridge--timer nil
+  "Repeating poll/self-heal timer, or nil.")
 
 ;;;; Directory helpers
 
@@ -155,26 +165,56 @@ Non-JSON or unparsable files are left in place untouched."
                (file-exists-p file))
       (ignore-errors (messenger-bridge--process-file file)))))
 
+(defun messenger-bridge--scan-inbox ()
+  "Process every JSON file currently in inbox/."
+  (dolist (f (directory-files (messenger-bridge--subdir "inbox") t "\\.json\\'"))
+    (ignore-errors (messenger-bridge--process-file f))))
+
+(defun messenger-bridge--arm-watch ()
+  "Ensure a valid `file-notify' watch on inbox/ exists."
+  (when (and messenger-bridge--watch
+             (not (file-notify-valid-p messenger-bridge--watch)))
+    (setq messenger-bridge--watch nil))
+  (unless messenger-bridge--watch
+    (ignore-errors
+      (setq messenger-bridge--watch
+            (file-notify-add-watch (messenger-bridge--subdir "inbox")
+                                   '(change) #'messenger-bridge--on-event)))))
+
+(defun messenger-bridge--tick ()
+  "Poll/self-heal: re-arm a dead watch and process any inbox backlog."
+  (messenger-bridge--arm-watch)
+  (messenger-bridge--scan-inbox))
+
 ;;;###autoload
 (defun messenger-bridge-start ()
-  "Start the bridge: process any inbox backlog, then watch inbox/."
+  "Start the bridge: process the inbox backlog, watch inbox/, and self-heal.
+A repeating poll (`messenger-bridge-poll-interval') re-arms the watch if it
+dies and catches any messages the watch missed, so delivery stays reliable."
   (interactive)
   (messenger-bridge--ensure-dirs)
-  (dolist (f (directory-files (messenger-bridge--subdir "inbox") t "\\.json\\'"))
-    (ignore-errors (messenger-bridge--process-file f)))
-  (unless messenger-bridge--watch
-    (setq messenger-bridge--watch
-          (file-notify-add-watch (messenger-bridge--subdir "inbox")
-                                 '(change) #'messenger-bridge--on-event)))
-  (message "messenger-bridge: watching %s" (messenger-bridge--subdir "inbox")))
+  (messenger-bridge--scan-inbox)
+  (messenger-bridge--arm-watch)
+  (when (and (numberp messenger-bridge-poll-interval)
+             (> messenger-bridge-poll-interval 0)
+             (not messenger-bridge--timer))
+    (setq messenger-bridge--timer
+          (run-with-timer messenger-bridge-poll-interval
+                          messenger-bridge-poll-interval
+                          #'messenger-bridge--tick)))
+  (message "messenger-bridge: watching %s (poll %ss)"
+           (messenger-bridge--subdir "inbox") messenger-bridge-poll-interval))
 
 ;;;###autoload
 (defun messenger-bridge-stop ()
-  "Stop watching the inbox directory."
+  "Stop watching the inbox directory and cancel the poll timer."
   (interactive)
   (when messenger-bridge--watch
     (file-notify-rm-watch messenger-bridge--watch)
     (setq messenger-bridge--watch nil))
+  (when messenger-bridge--timer
+    (cancel-timer messenger-bridge--timer)
+    (setq messenger-bridge--timer nil))
   (message "messenger-bridge: stopped"))
 
 ;;;; Default log handler (placeholder until a real consumer/EAR hooks in)
