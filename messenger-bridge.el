@@ -3,7 +3,7 @@
 ;; Copyright (c) 2026 Denis Butic
 
 ;; Author: Denis Butic <d.e.n.o@gmx.net>
-;; Version: 0.3.0
+;; Version: 0.3.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, tools
 ;; Homepage: https://github.com/deno1011/emacs-messenger-bridge
@@ -138,7 +138,11 @@ watcher never observes a partial file."
                        (format-time-string "%Y%m%dT%H%M%S" nil t) id))
          (target (messenger-bridge--subdir dir))
          (final (expand-file-name name target))
-         (tmp (expand-file-name (concat "." name ".tmp") target)))
+         (tmp (expand-file-name (concat "." name ".tmp") target))
+         ;; Force UTF-8 — otherwise emoji/umlauts in a message make
+         ;; `write-region' prompt "Select coding system", which hangs a
+         ;; headless/daemon call (no one to answer the minibuffer).
+         (coding-system-for-write 'utf-8-unix))
     (with-temp-file tmp
       (insert (json-serialize plist :null-object nil :false-object :false)))
     (rename-file tmp final t)
@@ -147,10 +151,11 @@ watcher never observes a partial file."
 (defun messenger-bridge--read-message (file)
   "Parse FILE as a message plist, or nil on error."
   (ignore-errors
-    (with-temp-buffer
-      (insert-file-contents file)
-      (json-parse-string (buffer-string)
-                         :object-type 'plist :null-object nil :false-object nil))))
+    (let ((coding-system-for-read 'utf-8))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (json-parse-string (buffer-string)
+                           :object-type 'plist :null-object nil :false-object nil)))))
 
 ;;;; Outbound
 
@@ -316,7 +321,8 @@ has not messaged you.  Mind the WhatsApp ban risk of messaging many contacts."
 (defun messenger-contacts ()
   "Return exported contacts as an alist (JID . plist) from contacts.json, or nil.
 The WhatsApp adapter writes contacts.json into `messenger-bridge-directory'."
-  (let ((f (expand-file-name "contacts.json" messenger-bridge-directory)))
+  (let ((f (expand-file-name "contacts.json" messenger-bridge-directory))
+        (coding-system-for-read 'utf-8))
     (when (file-exists-p f)
       (ignore-errors
         (with-temp-buffer
