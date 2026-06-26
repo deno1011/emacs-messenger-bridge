@@ -288,15 +288,33 @@ dies and catches any messages the watch missed, so delivery stays reliable."
 
 ;;;; Default log handler (placeholder until a real consumer/EAR hooks in)
 
+(defun messenger-bridge--sender-name (msg)
+  "Best display name for MSG's sender: the adapter-supplied meta name/pushName,
+else a merged contact whose channel handle matches :chat, else nil."
+  (let ((meta (plist-get msg :meta))
+        (chat (plist-get msg :chat)))
+    (or (and meta (or (plist-get meta :name) (plist-get meta :pushName)))
+        (let ((rec (seq-find
+                    (lambda (c) (rassoc chat (plist-get c :channels)))
+                    (ignore-errors (messenger-contacts)))))
+          (and rec (plist-get rec :name))))))
+
 (defun messenger-bridge-log-handler (msg)
-  "Append inbound MSG to the *messenger-bridge* buffer."
+  "Append inbound MSG to the *messenger-bridge* buffer.
+Shows the resolved sender name (with the raw id in parens) so a human is
+never shown only an opaque identifier."
   (with-current-buffer (get-buffer-create "*messenger-bridge*")
     (goto-char (point-max))
-    (insert (format "[%s] in  %s/%s: %s\n"
-                    (or (plist-get msg :timestamp) "?")
-                    (or (plist-get msg :channel) "?")
-                    (or (plist-get msg :chat) "?")
-                    (or (plist-get msg :text) "")))))
+    (let* ((chat (or (plist-get msg :chat) "?"))
+           (name (messenger-bridge--sender-name msg))
+           (who (if (and name (not (equal name chat)))
+                    (format "%s (%s)" name chat)
+                  chat)))
+      (insert (format "[%s] in  %s/%s: %s\n"
+                      (or (plist-get msg :timestamp) "?")
+                      (or (plist-get msg :channel) "?")
+                      who
+                      (or (plist-get msg :text) ""))))))
 
 (add-hook 'messenger-on-message-functions #'messenger-bridge-log-handler)
 
