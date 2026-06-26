@@ -318,52 +318,142 @@ has not messaged you.  Mind the WhatsApp ban risk of messaging many contacts."
   (setq messenger-send-allowlist (delete jid messenger-send-allowlist))
   (message "messenger: %s revoked" jid))
 
-(defun messenger-contacts ()
-  "Return exported contacts as an alist (JID . plist) from contacts.json, or nil.
-The WhatsApp adapter writes contacts.json into `messenger-bridge-directory'."
-  (let ((f (expand-file-name "contacts.json" messenger-bridge-directory))
-        (coding-system-for-read 'utf-8))
-    (when (file-exists-p f)
+;; Contacts are channel-agnostic here: each ADAPTER fetches its own channel's
+;; contacts and writes them, normalized, to <bridge>/contacts/<channel>.json as
+;; a JSON array of {e164, handle, name}.  This layer MERGES every channel's file
+;; on the E.164 number, so one name resolves across WhatsApp, Signal, etc.
+
+(defcustom messenger-contacts-directory
+  (expand-file-name "contacts" messenger-bridge-directory)
+  "Directory of per-channel contact files (<channel>.json) written by adapters."
+  :type 'directory :group 'messenger)
+
+(defcustom messenger-contacts-name-precedence '("whatsapp" "signal")
+  "Channel order used to pick a contact's display name (and a default send
+channel) when several channels know the same E.164 number."
+  :type '(repeat string) :group 'messenger)
+
+(defvar messenger-contacts--cache nil
+  "Merged contact records (list of plists); see `messenger-contacts-import'.")
+
+(defun messenger-contacts--read-channel (file)
+  "Read one channel FILE: a JSON array of {e164,handle,name} -> list of plists."
+  (let ((coding-system-for-read 'utf-8))
+    (when (file-exists-p file)
       (ignore-errors
         (with-temp-buffer
-          (insert-file-contents f)
-          (json-parse-string (buffer-string)
-                             :object-type 'alist :null-object nil))))))
+          (insert-file-contents file)
+          (append (json-parse-string (buffer-string)
+                                     :object-type 'plist :array-type 'list
+                                     :null-object nil)
+                  nil))))))
 
-(defun messenger-resolve-name (name)
-  "Return the JID of the contact matching NAME (case-insensitive substring).
-Signal an error if no match or if more than one contact matches."
+;;;###autoload
+(defun messenger-contacts-import (&optional verbose)
+  "Merge every per-channel file in `messenger-contacts-directory' on the E.164
+number into one table, cached in `messenger-contacts--cache' and returned.
+Each record is a plist (:e164 :name :channels ((CHANNEL . HANDLE) ...)).  A
+contact a channel exposes without a number is kept keyed by channel+handle."
+  (interactive (list t))
+  (let ((by-key (make-hash-table :test 'equal)))
+    (dolist (file (and (file-directory-p messenger-contacts-directory)
+                       (directory-files messenger-contacts-directory
+                                        t "\\.json\\'")))
+      (let ((channel (file-name-base file)))
+        (dolist (rec (messenger-contacts--read-channel file))
+          (let* ((e164 (plist-get rec :e164))
+                 (handle (plist-get rec :handle))
+                 (name (plist-get rec :name))
+                 (key (or e164 (format "%s:%s" channel handle))))
+            (when handle
+              (let ((cur (or (gethash key by-key)
+                             (puthash key (list :e164 e164 :name nil
+                                                :channels nil :names nil)
+                                      by-key))))
+                (setf (plist-get cur :channels)
+                      (cons (cons channel handle)
+                            (assoc-delete-all channel (plist-get cur :channels))))
+                (when (stringp name)
+                  (setf (plist-get cur :names)
+                        (cons (cons channel name)
+                              (assoc-delete-all channel (plist-get cur :names)))))
+                (when (and e164 (null (plist-get cur :e164)))
+                  (setf (plist-get cur :e164) e164))))))))
+    (let (result)
+      (maphash
+       (lambda (_k cur)
+         (let ((names (plist-get cur :names)))
+           (setf (plist-get cur :name)
+                 (or (seq-some (lambda (ch) (cdr (assoc ch names)))
+                               messenger-contacts-name-precedence)
+                     (cdar names)))
+           (push cur result)))
+       by-key)
+      (setq messenger-contacts--cache result)))
+  (when verbose
+    (message "messenger: imported %d contacts (%d on >1 channel)"
+             (length messenger-contacts--cache)
+             (seq-count (lambda (c) (> (length (plist-get c :channels)) 1))
+                        messenger-contacts--cache)))
+  messenger-contacts--cache)
+
+(defun messenger-contacts ()
+  "Return the merged contact records, importing lazily on first use."
+  (or messenger-contacts--cache (messenger-contacts-import)))
+
+(defun messenger-resolve (name)
+  "Return the merged contact record whose name matches NAME (substring, ci).
+Signal an error if there is no match or more than one."
   (let* ((needle (downcase name))
-         (matches
-          (seq-filter
-           (lambda (c)
-             (let* ((v (cdr c))
-                    (n (alist-get 'name v))
-                    (notify (alist-get 'notify v)))
-               (or (and (stringp n) (string-search needle (downcase n)))
-                   (and (stringp notify) (string-search needle (downcase notify))))))
-           (messenger-contacts))))
+         (matches (seq-filter
+                   (lambda (c)
+                     (let ((n (plist-get c :name)))
+                       (and (stringp n) (string-search needle (downcase n)))))
+                   (messenger-contacts))))
     (cond
      ((null matches) (user-error "messenger: no contact matches %S" name))
      ((cdr matches)
-      (user-error "messenger: %S is ambiguous (%d matches) — use the JID"
-                  name (length matches)))
-     (t (symbol-name (caar matches))))))
+      (user-error "messenger: %S is ambiguous (%d matches)" name (length matches)))
+     (t (car matches)))))
+
+(defun messenger-contact-handle (record &optional channel)
+  "Return (CHANNEL . HANDLE) to reach RECORD on.  Prefer CHANNEL if given and
+available; otherwise the first channel by `messenger-contacts-name-precedence'."
+  (let ((channels (plist-get record :channels)))
+    (if channel
+        (let ((h (cdr (assoc channel channels))))
+          (and h (cons channel h)))
+      (seq-some (lambda (ch)
+                  (let ((h (cdr (assoc ch channels))))
+                    (and h (cons ch h))))
+                (append messenger-contacts-name-precedence
+                        (mapcar #'car channels))))))
 
 ;;;###autoload
 (defun messenger-send-to-name (name text &optional channel)
-  "Resolve NAME to a JID via contacts and send TEXT (interactive: confirms).
-Called interactively, asks for confirmation and approves the recipient first —
-the smooth path for you to message a friend.  Programmatic callers should use
-`messenger-send' with an already-approved JID."
+  "Resolve NAME via merged contacts and send TEXT on CHANNEL (or the preferred
+one).  Interactive: pick name + channel, confirm, approve the recipient, send.
+Programmatic callers should pre-approve the handle (see `messenger-send')."
   (interactive
-   (let* ((name (read-string "Contact name: "))
-          (jid (messenger-resolve-name name)))
-     (unless (y-or-n-p (format "Send to %s (%s)? " name jid))
+   (let* ((rec (messenger-resolve (read-string "Contact name: ")))
+          (chans (mapcar #'car (plist-get rec :channels)))
+          (chan (if (cdr chans) (completing-read "Channel: " chans nil t)
+                  (car chans)))
+          (ch (messenger-contact-handle rec chan)))
+     (unless ch
+       (user-error "messenger: %s not reachable on %s" (plist-get rec :name) chan))
+     (unless (y-or-n-p (format "Send to %s on %s (%s)? "
+                               (plist-get rec :name) (car ch) (cdr ch)))
        (user-error "Cancelled"))
-     (messenger-allow-recipient jid)
-     (list name (read-string (format "Message to %s: " name)) nil)))
-  (messenger-send (messenger-resolve-name name) text channel))
+     (messenger-allow-recipient (cdr ch))
+     (list (plist-get rec :name)
+           (read-string (format "Message to %s: " (plist-get rec :name)))
+           (car ch))))
+  (let* ((rec (messenger-resolve name))
+         (ch (messenger-contact-handle rec channel)))
+    (unless ch
+      (user-error "messenger: %s not reachable on %s" name (or channel "any channel")))
+    (messenger-send (cdr ch) text (car ch))))
 
 (provide 'messenger-bridge)
 ;;; messenger-bridge.el ends here
